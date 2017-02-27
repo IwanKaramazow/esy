@@ -6,6 +6,7 @@ import * as path from 'path';
 import * as fs from 'fs';
 import os from 'os';
 import pathIsInside from 'path-is-inside';
+import outdent from 'outdent';
 
 import {mapObject} from './Utility';
 import * as Sandbox from './Sandbox';
@@ -107,55 +108,44 @@ const validatePackageJsonExportedEnvVar = (
   const ret = [];
   if (config.scopes !== undefined) {
     ret.push(
-      envVar +
-        " has a field 'scopes' (plural). You probably meant 'scope'. " +
-        'The owner of ' +
-        inPackageName +
-        ' likely made a mistake',
+      outdent`
+        ${envVar} has a field 'scopes' (plural). You probably meant 'scope'.
+        The owner of ${inPackageName} likely made a mistake.
+      `,
     );
   }
   const scopeObj = getScopes(config);
   if (!scopeObj.global) {
     if (!beginsWithPackagePrefix) {
       if (envVar.toUpperCase().indexOf(envVarConfigPrefix) === 0) {
+        /* eslint-disable max-len */
         ret.push(
-          'It looks like ' +
-            envVar +
-            ' is trying to be configured as a package scoped variable, ' +
-            'but it has the wrong capitalization. It should begin with ' +
-            envVarConfigPrefix +
-            '. The owner of ' +
-            inPackageName +
-            ' likely made a mistake',
+          outdent`
+            It looks like ${envVar} is trying to be configured as a package scoped variable, but it has the wrong capitalization. It should begin with ${envVarConfigPrefix}.  The owner of ${inPackageName} likely made a mistake.
+          `,
         );
+        /* eslint-enable max-len */
       } else {
+        /* eslint-disable max-len */
         ret.push(
-          'Environment variable ' +
-            envVar +
-            ' ' +
-            "doesn't begin with " +
-            envVarConfigPrefix +
-            " but it is not marked as 'global'. " +
-            'You should either prefix variables with ' +
-            envVarConfigPrefix +
-            ' or make them global.' +
-            'The author of ' +
-            inPackageName +
-            ' likely made a mistake',
+          outdent`
+            Environment variable ${envVar}  doesn't begin with ${envVarConfigPrefix} but it is not marked as 'global'. You should either prefix variables with ${envVarConfigPrefix} or make them global.
+            The author of ${inPackageName} likely made a mistake
+          `,
         );
+        /* eslint-enable max-len */
       }
     }
   } else {
     // Else, it's global, but better not be trying to step on another package!
     if (!beginsWithPackagePrefix && envVar.indexOf('__') !== -1) {
+      /* eslint-disable max-len */
       ret.push(
-        envVar +
-          " looks like it's trying to step on another " +
-          'package because it has a double underscore - which is how we express namespaced env vars. ' +
-          'The package owner for ' +
-          inPackageName +
-          ' likely made a mistake',
+        outdent`
+          ${envVar} looks like it's trying to step on another package because it has a double underscore - which is how we express namespaced env vars. The package owner for ${inPackageName} likely made a mistake
+        `,
       );
+      /* eslint-enable max-len */
     }
   }
   return ret;
