@@ -34,7 +34,7 @@ if [ -z "${ESY__STORE+x}" ]; then
 fi
 
 EJECT_PATH="$ESY__SANDBOX/node_modules/.cache/esy"
-ENV_PATH="$ESY__SANDBOX/node_modules/.cache/esy-env"
+ENV_PATH="$ESY__SANDBOX/node_modules/.cache/_esy/command-env"
 
 if [ -d "$ESY__SANDBOX/node_modules" ]; then
   DEPENDENCIES_PACKAGE_JSON=`find $ESY__SANDBOX/node_modules -name 'package.json'`

@@ -8,8 +8,7 @@ import os from 'os';
 import pathIsInside from 'path-is-inside';
 import outdent from 'outdent';
 
-import {mapObject} from './Utility';
-import * as Sandbox from './Sandbox';
+import * as BuildRepr from './build-repr';
 
 export type EnvironmentVar = {
   name: string,
@@ -18,8 +17,9 @@ export type EnvironmentVar = {
 };
 
 export type EnvironmentGroup = {
+  packageName: string,
+  packageVersion: string,
   packageJsonPath: string,
-  packageJson: Sandbox.PackageJson,
   envVars: Array<EnvironmentVar>,
   errors: Array<string>,
 };
@@ -30,7 +30,7 @@ type EnvironmentConfigState = {
   seenVars: {
     [name: string]: {
       packageJsonPath: string,
-      config: Sandbox.EnvironmentVarExport,
+      config: BuildRepr.EnvironmentVarExport,
     },
   },
   errors: Array<string>,
@@ -152,16 +152,11 @@ const validatePackageJsonExportedEnvVar = (
 };
 
 function builtInsPerPackage(
-  sandbox: Sandbox.Sandbox,
-  prefix: string,
-  packageInfo: Sandbox.PackageInfo,
-  installDirectory?: string,
+  config: BuildRepr.BuildConfig,
+  build: BuildRepr.Build,
+  currentlyBuilding: boolean,
 ) {
-  const {
-    packageJson: {name, version, esy},
-    rootDirectory,
-    dependencyTree,
-  } = packageInfo;
+  const prefix = currentlyBuilding ? 'cur' : envVarPrefix(build);
   function builtIn(val) {
     return {
       __BUILT_IN_DO_NOT_USE_OR_YOU_WILL_BE_PIPd: true,
@@ -171,20 +166,16 @@ function builtInsPerPackage(
     };
   }
   return {
-    [`${prefix}__name`]: builtIn(name),
-    [`${prefix}__version`]: builtIn(version || null),
+    [`${prefix}__name`]: builtIn(build.name),
+    [`${prefix}__version`]: builtIn(build.version || null),
     [`${prefix}__root`]: builtIn(
-      esy.buildsInSource
-        ? targetPath(sandbox, packageInfo, '_build')
-        : relativeToSandbox(sandbox.packageInfo.rootDirectory, rootDirectory),
+      currentlyBuilding && build.mutatesSourcePath
+        ? config.getBuildPath(build)
+        : build.sourcePath,
     ),
-    [`${prefix}__depends`]: builtIn(Object.keys(dependencyTree).join(' ')),
-    [`${prefix}__target_dir`]: builtIn(targetPath(sandbox, packageInfo, '_build')),
-    [`${prefix}__install`]: builtIn(
-      installDirectory != null
-        ? installDirectory
-        : targetPath(sandbox, packageInfo, '_install'),
-    ),
+    [`${prefix}__depends`]: builtIn(build.dependencies.map(dep => dep.name).join(' ')),
+    [`${prefix}__target_dir`]: builtIn(config.getBuildPath(build)),
+    [`${prefix}__install`]: builtIn(config.getInstallPath(build)),
     [`${prefix}__bin`]: builtIn(`$${prefix}__install/bin`),
     [`${prefix}__sbin`]: builtIn(`$${prefix}__install/sbin`),
     [`${prefix}__lib`]: builtIn(`$${prefix}__install/lib`),
@@ -260,38 +251,28 @@ function addEnvConfigForPackage(
   };
 }
 
-function computeEnvVarsForPackage(
-  sandbox: Sandbox.Sandbox,
-  packageInfo: Sandbox.PackageInfo,
-) {
-  const {rootDirectory, packageJson, normalizedName} = packageInfo;
-  const packageName = packageJson.name;
-  const envVarConfigPrefix = normalizedName;
+function computeEnvVarsForPackage(config: BuildRepr.BuildConfig, build: BuildRepr.Build) {
   const errors = [];
-  const autoExportedEnvVarsForPackage = builtInsPerPackage(
-    sandbox,
-    envVarConfigPrefix,
-    packageInfo,
-  );
+  const autoExportedEnvVarsForPackage = builtInsPerPackage(config, build, false);
 
   const envConfig = addEnvConfigForPackage(
     {seenVars: globalSeenVars, errors, normalizedEnvVars: []},
-    sandbox.packageInfo.rootDirectory,
-    packageName,
-    rootDirectory,
+    config.sandboxPath,
+    build.name,
+    build.sourcePath,
     autoExportedEnvVarsForPackage,
   );
 
   let {errors: nextErrors} = envConfig;
   const {seenVars, normalizedEnvVars} = envConfig;
 
-  for (const envVar in packageJson.esy.exportedEnv) {
+  for (const envVar in build.exportedEnv) {
     nextErrors = nextErrors.concat(
       validatePackageJsonExportedEnvVar(
         envVar,
-        packageJson.esy.exportedEnv[envVar],
-        packageName,
-        envVarConfigPrefix,
+        build.exportedEnv[envVar],
+        build.name,
+        envVarPrefix(build),
       ),
     );
   }
@@ -302,10 +283,10 @@ function computeEnvVarsForPackage(
     normalizedEnvVars: nextNormalizedEnvVars,
   } = addEnvConfigForPackage(
     {seenVars, errors: nextErrors, normalizedEnvVars},
-    sandbox.packageInfo.rootDirectory,
-    packageName,
-    path.join(rootDirectory, 'package.json'),
-    packageJson.esy.exportedEnv,
+    config.sandboxPath,
+    build.name,
+    path.join(build.sourcePath, 'package.json'),
+    build.exportedEnv,
   );
 
   /**
@@ -314,58 +295,52 @@ function computeEnvVarsForPackage(
    */
   globalSeenVars = nextSeenVars;
   globalGroups.push({
-    root: relativeToSandbox(sandbox.packageInfo.rootDirectory, rootDirectory),
+    packageName: build.name,
+    packageVersion: build.version,
+    root: relativeToSandbox(config.sandboxPath, build.sourcePath),
     packageJsonPath: relativeToSandbox(
-      sandbox.packageInfo.rootDirectory,
-      path.join(rootDirectory, 'package.json'),
+      config.sandboxPath,
+      path.join(build.sourcePath, 'package.json'),
     ),
-    packageJson,
     envVars: nextNormalizedEnvVars,
     errors: nextNextErrors,
   });
 }
 
-function targetPath(sandbox, packageInfo, tree: '_install' | '_build', ...pathTo) {
-  const packageName = packageInfo.packageJson.name;
-  const packageKey = Sandbox.packageInfoKey(sandbox.env, packageInfo);
-  const isRootPackage = packageName === sandbox.packageInfo.packageJson.name;
-  if (isRootPackage) {
-    return ['$esy__sandbox', tree, ...pathTo].join('/');
+function envVarPrefix(build: BuildRepr.Build): string {
+  let prefix = build.name;
+  if (prefix.startsWith('@')) {
+    prefix = prefix.slice(1);
   }
-  return ['$esy__store', tree, packageKey, ...pathTo].join('/');
+  return prefix.replace(/\./g, '_').replace(/\-/g, '_').replace(/\//g, '_');
 }
-
-type PackageEnvironmentOptions = {
-  installDirectory?: string,
-  useLooseEnvironment?: boolean,
-};
 
 /**
  * For a given package name within the package database, compute the environment
  * variable setup in terms of a hypothetical root.
  */
 export function calculateEnvironment(
-  sandbox: Sandbox.Sandbox,
-  packageInfo: Sandbox.PackageInfo,
-  options: PackageEnvironmentOptions = {},
+  config: BuildRepr.BuildConfig,
+  build: BuildRepr.Build,
+  globalEnv: BuildRepr.Environment,
 ): Environment {
   /**
    * The root package.json path on the "ejecting host" - that is, the host where
    * the universal build script is being computed. Everything else should be
    * relative to this.
    */
-  const curRootPackageJsonOnEjectingHost = packageInfo.rootDirectory;
+  const curRootPackageJsonOnEjectingHost = config.sandboxPath;
   globalSeenVars = {};
 
   function setUpBuiltinVariables(envConfigState: EnvironmentConfigState) {
-    let sandboxExportedEnvVars: {[name: string]: Sandbox.EnvironmentVarExport} = {
+    let sandboxExportedEnvVars: {[name: string]: BuildRepr.EnvironmentVarExport} = {
       esy__sandbox: {
-        val: '$ESY__SANDBOX',
+        val: config.sandboxPath,
         exclusive: true,
         __BUILT_IN_DO_NOT_USE_OR_YOU_WILL_BE_PIPd: true,
       },
       esy__store: {
-        val: '$ESY__STORE',
+        val: config.storePath,
         exclusive: true,
         __BUILT_IN_DO_NOT_USE_OR_YOU_WILL_BE_PIPd: true,
       },
@@ -379,20 +354,20 @@ export function calculateEnvironment(
         exclusive: true,
         __BUILT_IN_DO_NOT_USE_OR_YOU_WILL_BE_PIPd: true,
       },
-      ...builtInsPerPackage(sandbox, 'cur', packageInfo, options.installDirectory),
+      ...builtInsPerPackage(config, build, true),
       OCAMLFIND_CONF: {
         val: '$cur__target_dir/_esy/findlib.conf',
         exclusive: false,
       },
     };
 
-    const dependencies = Sandbox.collectTransitiveDependencies(packageInfo);
+    const dependencies = BuildRepr.collectTransitiveDependencies(build);
     if (dependencies.length > 0) {
       const depPath = dependencies
-        .map(dep => targetPath(sandbox, dep, '_install', 'bin'))
+        .map(dep => config.getFinalInstallPath(dep, 'bin'))
         .join(':');
       const depManPath = dependencies
-        .map(dep => targetPath(sandbox, dep, '_install', 'man'))
+        .map(dep => config.getFinalInstallPath(dep, 'man'))
         .join(':');
       sandboxExportedEnvVars = Object.assign(sandboxExportedEnvVars, {
         PATH: {
@@ -406,27 +381,33 @@ export function calculateEnvironment(
       });
     }
 
-    envConfigState = addEnvConfigForPackage(
-      envConfigState,
-      sandbox.packageInfo.rootDirectory,
-      'EsySandBox',
-      curRootPackageJsonOnEjectingHost,
-      mapObject(options.useLooseEnvironment ? sandbox.looseEnv : sandbox.env, env => ({
-        val: env,
+    const exportGlobalEnv = {};
+    for (let i = 0; i < globalEnv.length; i++) {
+      const v = globalEnv[i];
+      exportGlobalEnv[v.name] = {
+        val: v.value,
         exclusive: false,
         __BUILT_IN_DO_NOT_USE_OR_YOU_WILL_BE_PIPd: false,
-      })),
+      };
+    }
+
+    envConfigState = addEnvConfigForPackage(
+      envConfigState,
+      config.sandboxPath,
+      'EsySandBox',
+      curRootPackageJsonOnEjectingHost,
+      exportGlobalEnv,
     );
     envConfigState = addEnvConfigForPackage(
       envConfigState,
-      sandbox.packageInfo.rootDirectory,
+      config.sandboxPath,
       'EsySandBox',
       curRootPackageJsonOnEjectingHost,
       sandboxExportedEnvVars,
     );
     envConfigState = addEnvConfigForPackage(
       envConfigState,
-      sandbox.packageInfo.rootDirectory,
+      config.sandboxPath,
       'EsySandBox',
       curRootPackageJsonOnEjectingHost,
       {},
@@ -453,23 +434,14 @@ export function calculateEnvironment(
     globalSeenVars = seenVars;
     globalGroups = [
       {
+        packageName: '',
+        packageVersion: '',
         packageJsonPath: '',
-        packageJson: {
-          name: 'EsySandboxVariables',
-          esy: {
-            build: null,
-            buildsInSource: false,
-            exportedEnv: {},
-          },
-        },
         envVars: normalizedEnvVars,
         errors,
       },
     ];
-    Sandbox.traversePackageDependencyTree(
-      packageInfo,
-      computeEnvVarsForPackage.bind(null, sandbox),
-    );
+    BuildRepr.traverse(build, computeEnvVarsForPackage.bind(null, config));
   } catch (err) {
     if (err.code === 'ENOENT') {
       console.error('Fail to find package.json!: ' + err.message);
@@ -492,8 +464,8 @@ export function printEnvironment(groups: Environment) {
       const headerLines = [
         '',
         '# ' +
-          group.packageJson.name +
-          (group.packageJson.version ? '@' + group.packageJson.version : '') +
+          group.packageName +
+          (group.packageVersion ? '@' + group.packageVersion : '') +
           ' ' +
           group.packageJsonPath,
       ];
